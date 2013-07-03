@@ -15,9 +15,9 @@ The dtrace scripts are embellishments of concepts and code snippets from Brendan
 
 Following scripts are most important -
 
-1) iosltop (which displays IO rate, throughput and latency at a 5-second interval, in a top-like manner)
-2) biowait (which displays top blocked iowait consumers)
-3) connect.d (which displays top 'n' tcp latencies)
-4) hpstckgrowth.d (which displays top 10 heap and stack memory hogs)
-5) kmem_track.d (which tracks top 50 kernel memory cache hogs)
+1) iosltop (which displays IO rate, throughput and latency at a 5-second interval, in a top-like manner)<br/>
+2) biowait (which displays top blocked iowait consumers)<br/>
+3) connect.d (which displays top 'n' tcp latencies)<br/>
+4) hpstckgrowth.d (which displays top 10 heap and stack memory hogs)<br/>
+5) kmem_track.d (which tracks top 50 kernel memory cache hogs)<br/>
 
