@@ -1,0 +1,152 @@
+#!/usr/bin/perl
+#
+# --------------------------------------------------------------------------------------------------------------- #
+#$Id: biowait,v 1.3 2013/04/03 19:24:12 i08129r Exp i08129r $
+#$Log: biowait,v $
+#Revision 1.3  2013/04/03 19:24:12  i08129r
+#updated for ldom support (vdc devices)
+#
+#Revision 1.2  2012/11/06 20:52:04  i08129r
+#Script that wrappers a dtrace script to generate a "top" <n> number of processes that enter and/or exit the biowait state
+#with a map of their associated io devices.
+#Use case for this script is if you see there is some io device contention/locking issue. Then running this on the system will
+#likely identify processes that are in biowait state and blocking io to these devices from other processes.
+#Likely scenario is where the process enters the biowait state but doesn't exit or biowait entry has greater count than 
+#biowait return
+#
+#Revision 1.1  2012/11/06 20:50:33  i08129r
+#Initial revision
+#
+#
+# Need comments
+# --------------------------------------------------------------------------------------------------------------- #
+
+use lib $ENV{PWD};
+use finder;
+
+my ( %fvxio, %fvxdmp, %ddsk, %drdsk, %drmt );
+
+# If VxVM is installed, get the VxIO hash
+
+if ( -d "/dev/vx" ) {
+    %fvxio = finder::fndvxio;
+}
+
+# if VxDMP is installed, get the VxDMP hash
+
+if ( -d "/dev/vx/dmp" ) {
+    %fvxdmp = finder::fndvxdmp;
+}
+
+# Get the dsk, rdsk and rmt hashes
+
+%ddsk  = finder::fnddsk;
+%drdsk = finder::fnddrdsk;
+%drmt  = finder::fnddrmt;
+
+my $dtracescript = <<EOF;
+/usr/sbin/dtrace -n '
+
+#pragma D option quiet
+#pragma D option destructive
+#pragma D option bufsize=16m
+
+dtrace:::BEGIN {
+   printf("%s\\n", "Tracing...Ctrl-C to quit");
+}
+
+io:genunix:biowait:wait-start, io:genunix:biowait:wait-done {
+   this->caller = strjoin(probefunc,probename);
+   \@biowaiters[pid,curpsinfo->pr_psargs,this->caller,args[1]->dev_statname, args[1]->dev_major, args[1]->dev_minor] = count(); 
+}
+
+
+profile:::tick-1sec
+{
+     system("clear");
+     trunc(\@biowaiters, 10);
+     setopt("aggsortrev","6");
+     printf("%-8s:%28s:%20s:%28s:%12s:%12s:%12s\\n", "PID", "CMD", "FUNCTION", "DEVICE", "MAJOR#", "MINOR#", "COUNT");
+     printa("%-8d:%28s:%20s:%28s:%12d:%12d:%12\@d\\n", \@biowaiters);
+}'
+EOF
+
+sub dtraceit {
+
+    open( "DTRC", "$dtracescript |" ) or die "Can't run dtrace script:$!\n";
+
+    while ( my $line = <DTRC> ) {
+
+        #next if ($line =~ /^\s*/);
+        #next if ($line =~ /dtrace:\s*error/);
+        my ( $pid, $cmd, $function, $dev, $maj, $min, $count ) =
+          split( '\s*\:\s*', $line );
+        chomp( $pid, $cmd, $function, $dev, $maj, $min, $count );
+        $cmd =~ s/^\s+//;
+        $cmd =~ s/\s+$//;
+        $dev =~ s/\s+//;
+
+        #print "DEBUG: $dev \n";
+        if ( $line =~ /PID|CMD|DEVICE/ ) {
+            printf( "%-8s %28s %20s %28s %12s %12s %12s\n",
+                $pid, $cmd, $function, $dev, $maj, $min, $count );
+            next;
+        }
+        if ( $dev =~ /vxio/ ) {
+            chomp $min;
+            my @foo       = @{ $fvxio{$min} };
+            my $diskgroup = $foo[0];
+            my $device    = $foo[2];
+            if ( !$device )    { $device    = "UNDEF"; }
+            if ( !$diskgroup ) { $diskgroup = "UNDEF"; }
+            my $dgdev = "$diskgroup->$device";
+            printf( "%-8d %28s %20s %28s %12d %12d %12d\n",
+                $pid, $cmd, $function, $dgdev, $maj, $min, $count );
+        }
+        elsif ( $dev =~ /vxdmp/ ) {
+            chomp $min;
+            my @foo    = @{ $fvxdmp{$min} };
+            my $device = $foo[1];
+            if ( !$device ) { $device = "UNDEF"; }
+            printf( "%-8d %28s %20s %28s %12d %12d %12d\n",
+                $pid, $cmd, $function, $device, $maj, $min, $count );
+        }
+        elsif ( $dev =~ /sd|ssd|vdc/ ) {
+
+            # get the actual device from a sd/ssd hash
+            chomp( $maj, $min );
+            my $majmin   = "$maj" . "$min";
+            my @devarray = @{ $drdsk{$majmin} };
+            my $ctd      = $devarray[0];
+            chomp $ctd;
+            if ( !$ctd ) { $ctd = "UNDEF"; }
+            printf( "%-8d %28s %20s %28s %12d %12d %12d\n",
+                $pid, $cmd, $function, $ctd, $maj, $min, $count );
+        }
+        elsif ( $dev =~ /st/ ) {
+            chomp( $maj, $min );
+            my $majmin   = "$maj" . "$min";
+            my @devarray = @{ $drmt{$majmin} };
+            my $rmt      = $devarray[0];
+            if ( !$rmt ) { $rmt = "UNDEF"; }
+            chomp $rmt;
+            printf( "%-8d %28s %20s %28s %12d %12d %12d\n",
+                $pid, $cmd, $function, $rmt, $maj, $min, $count );
+        }
+        else {
+            print $line;
+        }
+    }
+    close(DTRC);
+}
+
+sub cleanupsig {
+}
+
+#print Dumper(\%drdsk);
+
+$SIG{INT}  = \&cleanupsig;    # Ctlr-C
+$SIG{QUIT} = \&cleanupsig;    # Ctlr-\
+$SIG{TERM} = \&cleanupsig;    # TERM
+
+&dtraceit;

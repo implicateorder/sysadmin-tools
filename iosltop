@@ -1,0 +1,392 @@
+#!/usr/bin/perl -w
+
+# ---------------------------------------------------------------------------------------------------------------- #
+#$Id: iosltop,v 1.3 2013/04/03 19:11:31 i08129r Exp i08129r $
+#$Log: iosltop,v $
+#Revision 1.3  2013/04/03 19:11:31  i08129r
+#Updated...added support for vdc driver (ldoms)
+#
+#Revision 1.2  2012/11/06 20:55:49  i08129r
+#This script has two functions -- 
+# 1) It will provide visualization of top 2 io events and latencies by default (or more with specific flag,
+# run with --help option for details on usage)
+# The visualizations are histograms of IO latency distributions (ms value) and IOP block sizes. 
+# What we need to watch for are outliers (if we see a device with huge latencies -- 100s of ms) and corresponding IOPs
+# histograms showing which process is writing to the device and IO block size distributions.
+# 2) Top 10 (by default or different number based on cmd-line switch) average IO throughputs and
+# Top 10 (or other number based on cmd-line switch) latency events on the system.
+# All data is presented at a 5 second clock tick interval
+# .
+#
+#Revision 1.1  2012/11/06 20:54:30  i08129r
+#Initial revision
+#
+#
+# Need comments
+# ---------------------------------------------------------------------------------------------------------------- #
+
+use Data::Dumper;
+use Getopt::Long;
+use lib $ENV{PWD};
+use finder;
+
+my $vistop  = '';
+my $lattop  = '';
+my $thrutop = '';
+my $help    = '';
+
+GetOptions(
+    "help"      => \$help,
+    "vistop=s"  => \$vistop,
+    "lattop=s"  => \$lattop,
+    "thrutop=s" => \$thrutop
+);
+
+if ( ($help) && ( $vistop or $lattop or $thrutop ) ) {
+    &printUsage && exit(1);
+}
+elsif ($help) {
+    &printUsage && exit(0);
+}
+else {
+
+    if ( !$vistop ) {
+        $vistop = "2";
+    }
+    if ( !$lattop ) {
+        $lattop = "5";
+    }
+    if ( !$thrutop ) {
+        $thrutop = "5";
+    }
+}
+
+$SIG{INT}  = \&cleanupsig;    # Ctlr-C
+$SIG{QUIT} = \&cleanupsig;    # Ctlr-\
+$SIG{TERM} = \&cleanupsig;    # TERM
+
+sub cleanupsig {
+}
+
+sub printUsage {
+    print
+      "Usage: $0 --help|--vistop=<number> --lattop=<number> --thrutop=<number>\n
+	--help 		- 	print this message
+	--vistop	-	top <number> of visualizations, defaults to top two IO and Latency events as histograms
+	--lattop	-	top <number> of average latency values
+	--thrutop	-	top <number of average Throughput values \n";
+}
+
+# Get the VxIO hash if VxVM is installed
+#
+my ( %fvxio, %fvxdmp );
+
+if ( -d "/dev/vx" ) {
+    %fvxio = finder::fndvxio;
+}
+
+# Get the VxDMP hash if VxDMP is installed
+#
+if ( -d "/dev/vx/dmp" ) {
+    %fvxdmp = finder::fndvxdmp;
+}
+
+# Get Disk, Raw Disk and rmt hashes
+#
+my %ddsk  = finder::fnddsk;
+my %drdsk = finder::fnddrdsk;
+my %drmt  = finder::fnddrmt;
+
+my $dtracescript = <<END;
+/usr/sbin/dtrace -n '
+
+#pragma D option quiet
+#pragma D option destructive
+#pragma D option bufsize=16m
+
+dtrace:::BEGIN
+{
+   printf("Tracing top IO sizes and latency events...Hit Ctrl-C to end tracing \\n");
+}
+
+io:::start {
+    start_time[arg0] = timestamp;
+    this->size = args[0]->b_bcount;
+    this->device = args[1]->dev_statname;
+    this->major = args[1]->dev_major;
+    this->minor = args[1]->dev_minor;
+    this->mount = args[2]->fi_mount;
+
+    this->pid = pid;
+    this->thruput = args[0]->b_bcount / 1024;
+
+    \@Size["D", this->pid, curpsinfo->pr_psargs, this->mount, this->device, this->major, this->minor] = quantize(this->size);
+
+   /* \@TotalThruput[this->pid,curpsinfo->pr_psargs, this->device] = avg(this->thruput); */
+   /* normalize(\@TotalThruput, (timestamp - start_time[arg0]) / 1000000000); */
+
+}
+
+io:::done /(args[0]->b_flags & B_READ) && (this->start = start_time[arg0])/ {
+    this->delta = (timestamp - this->start) /1000 /1000 ;
+    this->device = args[1]->dev_statname;
+    this->major = args[1]->dev_major;
+    this->minor = args[1]->dev_minor;
+    this->mount = args[2]->fi_mount;
+    this->thruput  =  args[0]->b_bcount / 1024;
+    this->pid = pid;
+    this->finame = args[2]->fi_pathname;
+
+    \@Latency["M", this->pid,"Read(ms)", this->mount, this->device, this->major, this->minor] = quantize(this->delta);
+    \@AvgLat["T", this->device, this->major, this->minor, "READIO"] = avg(this->delta);
+    \@Thruput["T", this->device, this->major, this->minor, "READIO"] = avg(this->thruput);
+
+    /* Normalize the output to give per second values */
+    /* default dtrace output is in nanoseconds	      */
+
+    normalize(\@Thruput, (timestamp - start_time[arg0]) / 1000000000);
+    start_time[arg0] = 0;
+}
+
+io:::done /(args[0]->b_flags & B_WRITE) && (this->start = start_time[arg0])/ {
+    this->delta = (timestamp - this->start) /1000 / 1000;
+    this->device = args[1]->dev_statname;
+    this->major = args[1]->dev_major;
+    this->minor = args[1]->dev_minor;
+    this->mount = args[2]->fi_mount;
+    this->finame = args[2]->fi_pathname;
+    this->pid = pid;
+    this->thruput  = args[0]->b_bcount / 1024;
+    \@Latency["M", this->pid, "Write(ms)", this->mount, this->device, this->major, this->minor] = quantize(this->delta);
+    \@AvgLat["T", this->device, this->major, this->minor, "WRITEIO"] = avg(this->delta);
+    \@Thruput["T", this->device, this->major, this->minor, "WRITEIO"] = avg(this->thruput);
+
+
+    /* Normalize the output to give per second values */
+    /* default dtrace output is in nanoseconds	      */
+
+    normalize(\@Thruput, (timestamp - start_time[arg0]) / 1000000000);
+    start_time[arg0] = 0;
+}
+
+
+profile:::tick-5sec
+{
+    system("clear");
+    trunc(\@Size,$vistop); trunc(\@Latency,$vistop); trunc(\@AvgLat,$lattop); trunc(\@Thruput,$thrutop); /* trunc(\@TotalThruput, $vistop); */
+    printf("\\n%-1s:%8s:%16s:%16s:%32s:%8s:%8s:%10s\\n", "D", "PID", "CMD", "MOUNT POINT", "DEVICE", "MAJNO", "MINNO", "Blk Sz");
+    printa("%-1s:%8d:%16s:%16s:%32s:%8d:%8d\\n%\@d\\n", \@Size);
+    printf("\\n%-1s:%8s:%16s:%16s:%32s:%8s:%8s:%10s\\n", "M", "PID", "IO_TYPE", "MOUNT POINT", "DEVICE", "MAJNO", "MINNO", "(MS)");
+    printa("%-1s:%8d:%16s:%16s:%32s:%8d:%8d\\n%\@d\\n", \@Latency);
+    
+    setopt("aggsortrev","3");
+    printf("\\n%-1s:%16s:%10s:%10s:%10s:%10s\\n", "T", "DEVICE", "MAJOR", "MINOR", "TYPE","AVG_IO_LATENCY_(ms)"); 
+    printa("%-1s:%16s:%10d:%10d:%10s:%\@d\\n", \@AvgLat);
+
+    setopt("aggsortrev","3");
+    printf("\\n%-1s:%16s:%10s:%10s:%10s:%10s\\n", "T", "DEVICE", "MAJOR", "MINOR", "TYPE","AVG_THRUPUT_(Kb/s)"); 
+    printa("%-1s:%16s:%10d:%10d:%10s:%\@d\\n", \@Thruput);
+
+}'
+END
+
+# Run dtrace, process output
+sub dtraceit {
+    open( DTRACE, "$dtracescript |" ) or die "Can't run dtrace (perms?): $!\n";
+
+    while ( my $line = <DTRACE> ) {
+        next if $line =~ /^\s*$/;
+        if ( $line =~ /^D.*/ ) {
+            my ( $label, $pid, $cmd, $mntpoint, $dev, $maj, $min ) =
+              split( '\s*\:\s*', $line );
+
+            #chomp($label, $pid, $cmd, $mntpoint, $dev, $maj, $min);
+            if ( $dev =~ /DEVICE/ ) {
+
+                # print label as is
+                printf( "\n%-1s %8s %16s %16s %32s %8s %8s\n",
+                    $label, $pid, $cmd, $mntpoint, $dev, $maj, $min );
+                next;
+            }
+            elsif ( $dev =~ /vxio/i ) {
+
+                # scan vxio hash to find device
+                chomp $min;
+                my @foo       = @{ $fvxio{$min} };
+                my $diskgroup = $foo[0];
+                my $device    = $foo[2];
+                if ( !$device )    { $device    = "UNDEF"; }
+                if ( !$diskgroup ) { $diskgroup = "UNDEF"; }
+                my $dgdev = "$diskgroup->$device";
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $cmd, $mntpoint, $dgdev, $maj, $min );
+            }
+            elsif ( $dev =~ /vxdmp/i ) {
+                chomp $min;
+                my @foo    = @{ $fvxdmp{$min} };
+                my $device = $foo[1];
+                if ( !$device ) { $device = "UNDEF"; }
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $cmd, $mntpoint, $device, $maj, $min );
+            }
+            elsif ( $dev =~ /sd|ssd|vdc/ ) {
+
+                # get the actual device from a sd/ssd hash
+                chomp( $maj, $min );
+                my $majmin   = "$maj" . "$min";
+                my @devarray = @{ $ddsk{$majmin} };
+                my $ctd      = $devarray[0];
+                chomp $ctd;
+                if ( !$ctd ) { $ctd = "UNDEF"; }
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $cmd, $mntpoint, $ctd, $maj, $min );
+            }
+            elsif ( $dev =~ /st/i ) {
+                chomp( $maj, $min );
+
+                #print "DEBUG2: $maj $min\n";
+                my $majmin   = "$maj" . "$min";
+                my @devarray = @{ $drmt{$majmin} };
+                my $rmt      = $devarray[0];
+                chomp $rmt;
+                if ( !$rmt ) { $rmt = "UNDEF"; }
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $cmd, $mntpoint, $rmt, $maj, $min );
+            }
+            else {
+                print "$line";
+            }
+        }
+        elsif ( $line =~ /^M.*/ ) {
+            my (
+                $label, $pid, $iotype, $mntpoint, $dev,
+                $maj,   $min, $type,   $val
+            ) = split( '\s*\:\s*', $line );
+
+        #chomp($label, $pid, $iotype, $mntpoint, $dev, $maj, $min, $type, $val);
+        #print "DEBUG3 -- $dev \n";
+            if ( $dev =~ m/DEVICE/ ) {
+                printf( "\n%-1s %8s %16s %16s %32s %8s %8s\n",
+                    $label, $pid, $iotype, $mntpoint, $dev, $maj, $min );
+                next;
+            }
+
+            elsif ( $dev =~ /vxio/i ) {
+
+                # scan vxio hash to find device
+                chomp $min;
+                my @foo       = @{ $fvxio{$min} };
+                my $diskgroup = $foo[0];
+                my $device    = $foo[2];
+                if ( !$device )    { $device    = "UNDEF"; }
+                if ( !$diskgroup ) { $diskgroup = "UNDEF"; }
+                my $dgdev = "$diskgroup->$device";
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $iotype, $mntpoint, $dgdev, $maj, $min );
+            }
+            elsif ( $dev =~ /vxdmp/i ) {
+                chomp $min;
+                my @foo    = @{ $fvxdmp{$min} };
+                my $device = $foo[1];
+                if ( !$device ) { $device = "UNDEF"; }
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $iotype, $mntpoint, $device, $maj, $min );
+            }
+            elsif ( $dev =~ /sd|ssd|vdc/i ) {
+
+                # get the actual device from a sd/ssd hash
+                chomp( $maj, $min );
+                my $majmin   = "$maj" . "$min";
+                my @devarray = @{ $ddsk{$majmin} };
+                my $ctd      = $devarray[0];
+                chomp $ctd;
+                if ( !$ctd ) { $ctd = "UNDEF"; }
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $iotype, $mntpoint, $ctd, $maj, $min );
+            }
+            elsif ( $dev =~ /st/i ) {
+                chomp( $maj, $min );
+
+                #print "DEBUG2: $maj $min\n";
+                my $majmin   = "$maj" . "$min";
+                my @devarray = @{ $drmt{$majmin} };
+                my $rmt      = $devarray[0];
+                chomp $rmt;
+                if ( !$rmt ) { $rmt = "UNDEF"; }
+                printf( "%-1s %8d %16s %16s %32s %8d %8d\n",
+                    $label, $pid, $iotype, $mntpoint, $rmt, $maj, $min );
+            }
+            else {
+                print $line;
+            }
+
+        }
+        elsif ( $line =~ /^T.*/ ) {
+            my ( $label, $dev, $maj, $min, $type, $val ) =
+              split( '\s*\:\s*', $line );
+
+            #chomp($label,$dev,$maj, $min, $type, $val);
+            if ( $dev =~ /DEVICE/ ) {
+                printf( "\n%-1s %24s\t%10s\t%10s\t%10s %10s\n",
+                    $label, $dev, $maj, $min, $type, $val );
+                next;
+            }
+            elsif ( $dev =~ /vxio/i ) {
+                chomp $min;
+                my @foo = @{ $fvxio{$min} };
+
+                #print "debug: @foo\n";
+                my $diskgroup = $foo[0];
+                my $device    = $foo[2];
+                if ( !$device )    { $device    = "UNDEF"; }
+                if ( !$diskgroup ) { $diskgroup = "UNDEF"; }
+                my $dgdev = "$diskgroup->$device";
+
+                printf( "%-1s %24s\t%10d\t%10d\t%10s %10d\n",
+                    $label, $dgdev, $maj, $min, $type, $val );
+            }
+            elsif ( $dev =~ /vxdmp/i ) {
+                chomp $min;
+                my @foo    = @{ $fvxdmp{$min} };
+                my $device = $foo[1];
+                if ( !$device ) { $device = "UNDEF"; }
+                printf( "%-1s %24s\t%10d\t%10d\t%10s %10d\n",
+                    $label, $device, $maj, $min, $type, $val );
+            }
+            elsif ( $dev =~ /sd|ssd|vdc/i ) {
+                chomp( $maj, $min );
+
+                #print "DEBUG2: $maj $min\n";
+                my $majmin   = "$maj" . "$min";
+                my @devarray = @{ $ddsk{$majmin} };
+                my $ctd      = $devarray[0];
+                chomp $ctd;
+                if ( !$ctd ) { $ctd = "UNDEF"; }
+                printf( "%-1s %24s\t%10d\t%10d\t%10s %10d\n",
+                    $label, $ctd, $maj, $min, $type, $val );
+            }
+            elsif ( $dev =~ /st/i ) {
+                chomp( $maj, $min );
+
+                #print "DEBUG2: $maj $min\n";
+                my $majmin   = "$maj" . "$min";
+                my @devarray = @{ $drmt{$majmin} };
+                my $rmt      = $devarray[0];
+                chomp $rmt;
+                if ( !$rmt ) { $rmt = "UNDEF"; }
+                printf( "%-1s %24s\t%10d\t%10d\t%10s %10d\n",
+                    $label, $rmt, $maj, $min, $type, $val );
+            }
+            else {
+                print $line;
+            }
+
+        }
+        else {
+            print "$line";
+        }
+    }
+    close DTRACE;
+}
+
+&dtraceit;
